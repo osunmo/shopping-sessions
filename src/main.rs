@@ -207,41 +207,6 @@ impl<V: Copy + Default> Table<V> {
 }
 
 // ---------- CSV dialect ----------
-#[inline]
-fn unq(f: Bytes) -> Option<Bytes> {
-    let n = f.len();
-    if n >= 2 && f[0] == b'"' && f[n - 1] == b'"' {
-        let inner = &f[1..n - 1];
-        if inner.contains(&b'"') { None } else { Some(inner) }
-    } else if f.contains(&b'"') {
-        None
-    } else {
-        Some(f)
-    }
-}
-
-/// Split one line (small files only).
-fn split<const N: usize>(line: Bytes) -> Option<[Bytes; N]> {
-    let mut out: [Bytes; N] = [b""; N];
-    let mut k = 0;
-    let mut st = 0;
-    for (i, &c) in line.iter().enumerate() {
-        if c == b',' {
-            if k >= N - 1 {
-                return None;
-            }
-            out[k] = unq(&line[st..i])?;
-            k += 1;
-            st = i + 1;
-        }
-    }
-    if k != N - 1 {
-        return None;
-    }
-    out[k] = unq(&line[st..])?;
-    Some(out)
-}
-
 /// Bit masks of (',' | '"' | '\n', '"', '\n') for the 64 bytes at base (zero past the end).
 #[inline(always)]
 fn masks(d: &[u8], base: usize) -> (u64, u64, u64) {
@@ -940,20 +905,76 @@ fn main() {
         .fold(
             || Acc { users: vec![], camp: vec![[0; 4]; ncs * ndays] },
             |mut acc, bi| {
-                let n: usize = kept_parts.iter().map(|p| p[bi].len()).sum();
-                let mut ev: Vec<Kept> = Vec::with_capacity(n);
-                for p in &kept_parts {
-                    ev.extend_from_slice(&p[bi].take());
+                let mine: Vec<Vec<Kept>> = kept_parts.iter().map(|p| p[bi].take()).collect();
+                let n: usize = mine.iter().map(|p| p.len()).sum();
+                // group events by person (exact: hash and key) with counting sort
+                let mut pt = PTab::new(n / 4 + 64);
+                let mut pid: Vec<u32> = Vec::with_capacity(n);
+                let mut cnt: Vec<u32> = vec![];
+                for p in &mine {
+                    for e in p {
+                        let i = pt.get_or_insert(e.ph, &e.pk);
+                        if i as usize == cnt.len() {
+                            cnt.push(0);
+                        }
+                        cnt[i as usize] += 1;
+                        pid.push(i);
+                    }
                 }
-                let m: usize = ck_parts.iter().map(|p| p[bi].len()).sum();
-                let mut ck: Vec<Ck> = Vec::with_capacity(m);
+                let np = cnt.len();
+                let mut off: Vec<u32> = Vec::with_capacity(np + 1);
+                let mut s = 0u32;
+                for &c in &cnt {
+                    off.push(s);
+                    s += c;
+                }
+                off.push(s);
+                let mut fill: Vec<u32> = off[..np].to_vec();
+                let mut evs: Vec<Ec> = vec![Ec::default(); n];
+                let mut k = 0;
+                for p in &mine {
+                    for e in p {
+                        let i = pid[k] as usize;
+                        k += 1;
+                        evs[fill[i] as usize] = Ec { ts: e.ts, price: e.price, cat: e.cat, purchase: e.purchase };
+                        fill[i] += 1;
+                    }
+                }
+                drop(mine);
+                drop(pid);
+                // clicks of the same people
+                let mut cpid: Vec<u32> = vec![];
+                let mut ccnt: Vec<u32> = vec![0; np];
                 for p in &ck_parts {
-                    ck.extend_from_slice(&p[bi]);
+                    for c in &p[bi] {
+                        let i = pt.get(c.ph, &c.pk);
+                        if i != u32::MAX {
+                            ccnt[i as usize] += 1;
+                        }
+                        cpid.push(i);
+                    }
                 }
-                ev.sort_unstable_by_key(|e| (e.ph, e.ts));
-                ck.sort_unstable_by(|a, b| {
-                    a.ph.cmp(&b.ph).then(a.ts.cmp(&b.ts)).then_with(|| unpack(a.cid).cmp(unpack(b.cid)))
-                });
+                let mut coff: Vec<u32> = Vec::with_capacity(np + 1);
+                let mut s = 0u32;
+                for &c in &ccnt {
+                    coff.push(s);
+                    s += c;
+                }
+                coff.push(s);
+                let mut cfill: Vec<u32> = coff[..np].to_vec();
+                let mut cks: Vec<Cc> = vec![Cc::default(); s as usize];
+                let mut k = 0;
+                for p in &ck_parts {
+                    for c in &p[bi] {
+                        let i = cpid[k];
+                        k += 1;
+                        if i != u32::MAX {
+                            cks[cfill[i as usize] as usize] = Cc { ts: c.ts, cid: c.cid, camp: c.camp };
+                            cfill[i as usize] += 1;
+                        }
+                    }
+                }
+                drop(cpid);
                 let mut st = State {
                     cnt: vec![0u32; ncamp],
                     pos: vec![0u32; ncamp],
@@ -961,39 +982,16 @@ fn main() {
                     catsum: vec![0i64; ncat],
                     touched: vec![],
                 };
-                let mut ci = 0;
-                let mut i = 0;
-                while i < ev.len() {
-                    let h = ev[i].ph;
-                    let mut j = i + 1;
-                    while j < ev.len() && ev[j].ph == h {
-                        j += 1;
+                for i in 0..np {
+                    let es = &mut evs[off[i] as usize..off[i + 1] as usize];
+                    if es.len() > 1 {
+                        es.sort_unstable_by_key(|e| e.ts);
                     }
-                    while ci < ck.len() && ck[ci].ph < h {
-                        ci += 1;
+                    let cs = &mut cks[coff[i] as usize..coff[i + 1] as usize];
+                    if cs.len() > 1 {
+                        cs.sort_unstable_by(|a, b| a.ts.cmp(&b.ts).then_with(|| unpack(a.cid).cmp(unpack(b.cid))));
                     }
-                    let mut cj = ci;
-                    while cj < ck.len() && ck[cj].ph == h {
-                        cj += 1;
-                    }
-                    let es = &ev[i..j];
-                    let cs = &ck[ci..cj];
-                    let n0 = es[0].pk;
-                    if es.iter().all(|e| e.pk.same(&n0)) && cs.iter().all(|c| c.pk.same(&n0)) {
-                        person(es, cs, &mut st, &mut acc.users, &mut acc.camp, &g);
-                    } else {
-                        // 64-bit hash collision between two person names: split by name
-                        let mut nm: Vec<Vec<u8>> = es.iter().map(|e| e.pk.bytes()).collect();
-                        nm.sort();
-                        nm.dedup();
-                        for name in nm {
-                            let e2: Vec<Kept> = es.iter().filter(|e| e.pk.bytes() == name).copied().collect();
-                            let c2: Vec<Ck> = cs.iter().filter(|c| c.pk.bytes() == name).copied().collect();
-                            person(&e2, &c2, &mut st, &mut acc.users, &mut acc.camp, &g);
-                        }
-                    }
-                    i = j;
-                    ci = cj;
+                    person(pt.names[i], es, cs, &mut st, &mut acc.users, &mut acc.camp, &g);
                 }
                 acc
             },
@@ -1043,6 +1041,82 @@ fn main() {
     );
 }
 
+/// Compact per-event and per-click records for phase C.
+#[derive(Clone, Copy, Default)]
+struct Ec {
+    ts: i64,
+    price: u32,
+    cat: u16,
+    purchase: bool,
+}
+#[derive(Clone, Copy, Default)]
+struct Cc {
+    ts: i64,
+    cid: u64,
+    camp: u16,
+}
+
+/// Person table for one bucket: (hash, Key) -> dense index. Grows at half load.
+struct PTab {
+    mask: usize,
+    slots: Vec<(u64, u32)>,
+    names: Vec<Key>,
+}
+impl PTab {
+    fn new(n: usize) -> Self {
+        let cap = (n * 2).next_power_of_two().max(64);
+        PTab { mask: cap - 1, slots: vec![(0, u32::MAX); cap], names: vec![] }
+    }
+    #[inline]
+    fn get(&self, h: u64, k: &Key) -> u32 {
+        let mut i = (h as usize) & self.mask;
+        loop {
+            let (sh, si) = self.slots[i];
+            if si == u32::MAX {
+                return u32::MAX;
+            }
+            if sh == h && self.names[si as usize].same(k) {
+                return si;
+            }
+            i = (i + 1) & self.mask;
+        }
+    }
+    #[inline]
+    fn get_or_insert(&mut self, h: u64, k: &Key) -> u32 {
+        let mut i = (h as usize) & self.mask;
+        loop {
+            let (sh, si) = self.slots[i];
+            if si == u32::MAX {
+                let id = self.names.len() as u32;
+                self.slots[i] = (h, id);
+                self.names.push(*k);
+                if self.names.len() * 2 > self.slots.len() {
+                    self.grow();
+                }
+                return id;
+            }
+            if sh == h && self.names[si as usize].same(k) {
+                return si;
+            }
+            i = (i + 1) & self.mask;
+        }
+    }
+    fn grow(&mut self) {
+        let cap = self.slots.len() * 2;
+        let old = std::mem::replace(&mut self.slots, vec![(0, u32::MAX); cap]);
+        self.mask = cap - 1;
+        for (h, id) in old {
+            if id != u32::MAX {
+                let mut i = (h as usize) & self.mask;
+                while self.slots[i].1 != u32::MAX {
+                    i = (i + 1) & self.mask;
+                }
+                self.slots[i] = (h, id);
+            }
+        }
+    }
+}
+
 struct Glob<'a> {
     ndays: usize,
     day_lo: i64,
@@ -1079,8 +1153,7 @@ fn flush_day(st: &mut State, row: &mut URow, users: &mut Vec<URow>, cat_rank: &[
 }
 
 /// One person: events sorted by ts, clicks sorted by (ts, click_id).
-fn person(es: &[Kept], cs: &[Ck], st: &mut State, users: &mut Vec<URow>, camp: &mut [[i64; 4]], g: &Glob) {
-    let name = es[0].pk;
+fn person(name: Key, es: &[Ec], cs: &[Cc], st: &mut State, users: &mut Vec<URow>, camp: &mut [[i64; 4]], g: &Glob) {
     let mut row = URow { name, day: i32::MIN, sessions: 0, events: 0, revenue: 0, top: -1 };
     let (mut lo, mut hi) = (0usize, 0usize);
     let mut i = 0;
