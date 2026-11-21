@@ -12,7 +12,9 @@ use rayon::prelude::*;
 use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use std::time::Instant;
+
 
 type Bytes = &'static [u8];
 
@@ -505,11 +507,55 @@ fn leak_mmap(p: &Path) -> Bytes {
         return b"";
     }
     let m = unsafe { memmap2::Mmap::map(&f).expect("mmap") };
-    // start reading the whole file now (no-op when it is already cached)
-    let _ = m.advise(memmap2::Advice::WillNeed);
+    if std::env::var_os("WILLNEED").is_some() {
+        let _ = m.advise(memmap2::Advice::WillNeed);
+    }
     let m: &'static memmap2::Mmap = Box::leak(Box::new(m));
     &m[..]
 }
+/// Warm the page cache with many reads in flight: a cold disk is only fast at a deep queue,
+/// which page faults from the parser threads alone do not reach. Cheap when already cached.
+fn prefetch(paths: Vec<PathBuf>) {
+    use std::os::unix::io::AsRawFd;
+    use std::sync::atomic::AtomicUsize;
+    let mode = std::env::var("PREFETCH").unwrap_or("none".into());
+    if mode == "none" {
+        return;
+    }
+    let nt: usize = std::env::var("PFT").ok().and_then(|s| s.parse().ok()).unwrap_or(16);
+    const BLK: u64 = 2 << 20;
+    let mut jobs: Vec<(usize, u64)> = vec![];
+    let files: Vec<File> = paths.iter().filter_map(|p| File::open(p).ok()).collect();
+    for (i, f) in files.iter().enumerate() {
+        let len = f.metadata().map(|m| m.len()).unwrap_or(0);
+        let mut o = 0;
+        while o < len {
+            jobs.push((i, o));
+            o += BLK;
+        }
+    }
+    let st: &'static (Vec<File>, Vec<(usize, u64)>, AtomicUsize, String) =
+        Box::leak(Box::new((files, jobs, AtomicUsize::new(0), mode)));
+    for _ in 0..nt {
+        std::thread::spawn(move || {
+            let (files, jobs, next, mode) = st;
+            let mut buf = if mode == "pread" { vec![0u8; BLK as usize] } else { vec![] };
+            loop {
+                let k = next.fetch_add(1, Ordering::Relaxed);
+                let Some(&(i, o)) = jobs.get(k) else { break };
+                let fd = files[i].as_raw_fd();
+                unsafe {
+                    if mode == "pread" {
+                        libc::pread(fd, buf.as_mut_ptr() as *mut libc::c_void, BLK as usize, o as i64);
+                    } else {
+                        libc::readahead(fd, o as i64, BLK as usize);
+                    }
+                }
+            }
+        });
+    }
+}
+
 fn list_csv(dir: &Path) -> Vec<PathBuf> {
     let mut v: Vec<PathBuf> = match std::fs::read_dir(dir) {
         Ok(rd) => rd
@@ -757,6 +803,7 @@ fn main() {
     let ck_paths = list_csv(&data.join("clicks"));
     let lk_paths = list_csv(&data.join("links"));
     log(&t0, &format!("files: {} events, {} clicks, {} links", ev_paths.len(), ck_paths.len(), lk_paths.len()));
+    prefetch(lk_paths.iter().chain(ev_paths.iter()).chain(ck_paths.iter()).cloned().collect());
 
     // ---------- phase A ----------
     let (links, (parts, ck_raw)) = rayon::join(
@@ -1107,6 +1154,8 @@ fn main() {
         &t0,
         &format!("done: {} user rows, {} campaign rows", accs.iter().map(|a| a.users.len()).sum::<usize>(), crow.len()),
     );
+    // skip destructors and allocator teardown; the kernel reclaims everything
+    std::process::exit(0);
 }
 
 /// Event with its person index, for the radix sort in phase C.
