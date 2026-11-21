@@ -514,13 +514,11 @@ impl<T: Default> Take<T> {
         Take(std::cell::UnsafeCell::new(t))
     }
     /// Safety contract: each bucket index is processed by exactly one task.
+    fn get(&self) -> &T {
+        unsafe { &*self.0.get() }
+    }
     fn take(&self) -> T {
         unsafe { std::mem::take(&mut *self.0.get()) }
-    }
-}
-impl<T> Take<Vec<T>> {
-    fn len(&self) -> usize {
-        unsafe { (*self.0.get()).len() }
     }
 }
 
@@ -529,18 +527,17 @@ impl<T> Take<Vec<T>> {
 struct Ev {
     eh: u64,
     eid: u64, // packed ref, compared only when hashes match
-    ingest: i64,
-    ts: i64,
     uk: Key,
+    ingest: u32, // seconds since INGEST_BASE (ingest_ts is always whole-second F1)
+    ts: u32,     // ms since the click window start
     price: u32,
     cat: u16,
     flags: u8, // 1 = valid, 2 = purchase
 }
 #[derive(Clone, Copy)]
 struct Kept {
-    ph: u64,
-    pk: Key,
-    ts: i64,
+    pk: Key, // person name; its hash is pk.h()
+    ts: u32,
     price: u32,
     cat: u16,
     purchase: bool,
@@ -549,15 +546,14 @@ struct Kept {
 struct RawCk {
     uh: u64,
     uk: Key,
-    ts: i64,
+    ts: u32,
     cid: u64,
     camp: u16,
 }
 #[derive(Clone, Copy)]
 struct Ck {
-    ph: u64,
     pk: Key,
-    ts: i64,
+    ts: u32,
     cid: u64,
     camp: u16,
 }
@@ -672,6 +668,8 @@ fn main() {
     let ws = field("window_start");
     let we = field("window_end");
     let ck_lo = ws - WEEK;
+    // ingest_ts only orders copies of one event: seconds from well before any window
+    let ibase = ws - 1000 * DAY;
 
     // products & campaigns
     let mut cat_names: Vec<Bytes> = vec![];
@@ -734,9 +732,9 @@ fn main() {
                         let mut e = Ev {
                             eh,
                             eid: pack(eid),
-                            ingest,
-                            ts: 0,
                             uk: Key::default(),
+                            ingest: (ingest.saturating_sub(ibase) / SEC).clamp(0, u32::MAX as i64) as u32,
+                            ts: 0,
                             price: 0,
                             cat: 0,
                             flags: 0,
@@ -763,7 +761,7 @@ fn main() {
                             if ingest.saturating_sub(t) > LATE {
                                 break 'v;
                             }
-                            e.ts = t;
+                            e.ts = (t - ck_lo) as u32;
                             e.uk = Key::new(uid);
                             e.cat = products.get_b(pid).unwrap_or(unknown_cat);
                             e.flags = 1 | if purchase { 2 } else { 0 };
@@ -789,7 +787,7 @@ fn main() {
                         }
                         let Some(ci) = campaigns.get_b(camp) else { return };
                         let uk = Key::new(uid);
-                        v.push(RawCk { uh: uk.h(), uk, ts: t, cid: pack(cid), camp: ci });
+                        v.push(RawCk { uh: uk.h(), uk, ts: (t - ck_lo) as u32, cid: pack(cid), camp: ci });
                     });
                     v
                 })
@@ -805,63 +803,85 @@ fn main() {
     let kept_parts: Vec<Vec<Vec<Kept>>> = (0..NB)
         .into_par_iter()
         .map(|bi| {
-            let n: usize = parts.iter().map(|p| p[bi].len()).sum();
-            let mut v: Vec<Ev> = Vec::with_capacity(n);
-            for p in &parts {
-                v.extend_from_slice(&p[bi].take());
+            // this bucket's slices, read in place
+            let sl: Vec<&[Ev]> = parts.iter().map(|p| p[bi].get().as_slice()).collect();
+            let mut offs: Vec<u32> = Vec::with_capacity(sl.len() + 1);
+            let mut n = 0u32;
+            for x in &sl {
+                offs.push(n);
+                n += x.len() as u32;
             }
+            offs.push(n);
+            let at = |i: u32| -> &Ev {
+                let p = offs.partition_point(|&o| o <= i) - 1;
+                &sl[p][(i - offs[p]) as usize]
+            };
+            let n = n as usize;
             let cap = (n * 2).next_power_of_two().max(16);
             let mask = cap - 1;
             // slot: (tag = low 32 bits of hash, index of the earliest-ingested copy so far)
             let mut tab: Vec<(u32, u32)> = vec![(0, u32::MAX); cap];
-            for (i, e) in v.iter().enumerate() {
-                let tag = e.eh as u32;
-                let mut s = ((e.eh >> 20) as usize) & mask;
-                loop {
-                    let (tg, t) = tab[s];
-                    if t == u32::MAX {
-                        tab[s] = (tag, i as u32);
-                        break;
-                    }
-                    if tg == tag {
-                        let o = &v[t as usize];
-                        if o.eh == e.eh && unpack(o.eid) == unpack(e.eid) {
-                            if e.ingest < o.ingest {
-                                tab[s].1 = i as u32;
-                            }
+            let mut win = vec![true; n];
+            let mut i = 0u32;
+            for x in &sl {
+                for e in x.iter() {
+                    let tag = e.eh as u32;
+                    let mut s = ((e.eh >> 20) as usize) & mask;
+                    loop {
+                        let (tg, t) = tab[s];
+                        if t == u32::MAX {
+                            tab[s] = (tag, i);
                             break;
                         }
+                        if tg == tag {
+                            let o = at(t);
+                            if o.eh == e.eh && unpack(o.eid) == unpack(e.eid) {
+                                if e.ingest < o.ingest {
+                                    win[t as usize] = false;
+                                    tab[s].1 = i;
+                                } else {
+                                    win[i as usize] = false;
+                                }
+                                break;
+                            }
+                        }
+                        s = (s + 1) & mask;
                     }
-                    s = (s + 1) & mask;
-                }
-            }
-            let mut win = vec![false; n];
-            for &(_, t) in &tab {
-                if t != u32::MAX {
-                    win[t as usize] = true;
+                    i += 1;
                 }
             }
             drop(tab);
-            let idx: Vec<u32> = (0..n as u32).filter(|&t| win[t as usize] && v[t as usize].flags & 1 != 0).collect();
-            let mut out: Vec<Vec<Kept>> = (0..NB).map(|_| Vec::with_capacity(idx.len() / NB + 16)).collect();
-            let hs: Vec<u64> = idx.iter().map(|&t| v[t as usize].uk.h()).collect();
+            let mut keep: Vec<&Ev> = Vec::with_capacity(n);
+            let mut i = 0usize;
+            for x in &sl {
+                for e in x.iter() {
+                    if win[i] && e.flags & 1 != 0 {
+                        keep.push(e);
+                    }
+                    i += 1;
+                }
+            }
+            let hs: Vec<u64> = keep.iter().map(|e| e.uk.h()).collect();
+            let mut out: Vec<Vec<Kept>> = (0..NB).map(|_| Vec::with_capacity(keep.len() / NB + 16)).collect();
             for &h in hs.iter().take(PD) {
                 links.prefetch(h);
             }
-            for (k, &t) in idx.iter().enumerate() {
+            for (k, e) in keep.iter().enumerate() {
                 if let Some(&nh) = hs.get(k + PD) {
                     links.prefetch(nh);
                 }
-                let e = &v[t as usize];
                 let (ph, pk) = resolve(links, &e.uk, hs[k]);
                 unsafe { out.get_unchecked_mut((ph >> SHIFT) as usize) }.push(Kept {
-                    ph,
                     pk,
                     ts: e.ts,
                     price: e.price,
                     cat: e.cat,
                     purchase: e.flags & 2 != 0,
                 });
+            }
+            drop(keep);
+            for p in &parts {
+                drop(p[bi].take());
             }
             out
         })
@@ -878,7 +898,7 @@ fn main() {
                     links.prefetch(nx.uh);
                 }
                 let (ph, pk) = resolve(links, &c.uk, c.uh);
-                unsafe { b.get_unchecked_mut((ph >> SHIFT) as usize) }.push(Ck { ph, pk, ts: c.ts, cid: c.cid, camp: c.camp });
+                unsafe { b.get_unchecked_mut((ph >> SHIFT) as usize) }.push(Ck { pk, ts: c.ts, cid: c.cid, camp: c.camp });
             }
             b
         })
@@ -892,7 +912,7 @@ fn main() {
     let ndays = (day_hi - day_lo + 1) as usize;
     let ncs = ncamp + 1; // + organic
     let ncat = cat_names.len();
-    let g = Glob { ndays, day_lo, ncamp, cat_rank: &cat_rank };
+    let g = Glob { base: ck_lo, ndays, day_lo, ncamp, cat_rank: &cat_rank };
 
     struct Acc {
         users: Vec<URow>,
@@ -913,7 +933,7 @@ fn main() {
                 let mut cnt: Vec<u32> = vec![];
                 for p in &mine {
                     for e in p {
-                        let i = pt.get_or_insert(e.ph, &e.pk);
+                        let i = pt.get_or_insert(e.pk.h(), &e.pk);
                         if i as usize == cnt.len() {
                             cnt.push(0);
                         }
@@ -947,7 +967,7 @@ fn main() {
                 let mut ccnt: Vec<u32> = vec![0; np];
                 for p in &ck_parts {
                     for c in &p[bi] {
-                        let i = pt.get(c.ph, &c.pk);
+                        let i = pt.get(c.pk.h(), &c.pk);
                         if i != u32::MAX {
                             ccnt[i as usize] += 1;
                         }
@@ -1044,14 +1064,14 @@ fn main() {
 /// Compact per-event and per-click records for phase C.
 #[derive(Clone, Copy, Default)]
 struct Ec {
-    ts: i64,
+    ts: u32,
     price: u32,
     cat: u16,
     purchase: bool,
 }
 #[derive(Clone, Copy, Default)]
 struct Cc {
-    ts: i64,
+    ts: u32,
     cid: u64,
     camp: u16,
 }
@@ -1118,6 +1138,7 @@ impl PTab {
 }
 
 struct Glob<'a> {
+    base: i64, // epoch ms of relative ts 0
     ndays: usize,
     day_lo: i64,
     ncamp: usize,
@@ -1159,12 +1180,12 @@ fn person(name: Key, es: &[Ec], cs: &[Cc], st: &mut State, users: &mut Vec<URow>
     let mut i = 0;
     let n = es.len();
     while i < n {
-        let start = es[i].ts;
+        let start = es[i].ts as i64;
         let mut j = i + 1;
-        while j < n && es[j].ts - es[j - 1].ts <= GAP {
+        while j < n && (es[j].ts - es[j - 1].ts) as i64 <= GAP {
             j += 1;
         }
-        let day = start.div_euclid(DAY);
+        let day = (g.base + start).div_euclid(DAY);
         if day as i32 != row.day {
             flush_day(st, &mut row, users, g.cat_rank);
             row = URow { name, day: day as i32, sessions: 0, events: 0, revenue: 0, top: -1 };
@@ -1187,7 +1208,7 @@ fn person(name: Key, es: &[Ec], cs: &[Cc], st: &mut State, users: &mut Vec<URow>
         row.revenue += rev;
 
         // clicks in [start - 7d, start]: a sliding window with per-campaign counts
-        while hi < cs.len() && cs[hi].ts <= start {
+        while hi < cs.len() && cs[hi].ts as i64 <= start {
             let c = cs[hi].camp as usize;
             if st.cnt[c] == 0 {
                 st.pos[c] = st.active.len() as u32;
@@ -1196,7 +1217,7 @@ fn person(name: Key, es: &[Ec], cs: &[Cc], st: &mut State, users: &mut Vec<URow>
             st.cnt[c] += 1;
             hi += 1;
         }
-        while lo < hi && cs[lo].ts < start - WEEK {
+        while lo < hi && (cs[lo].ts as i64) < start - WEEK {
             let c = cs[lo].camp as usize;
             st.cnt[c] -= 1;
             if st.cnt[c] == 0 {
