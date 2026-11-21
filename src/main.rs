@@ -21,10 +21,10 @@ const DAY: i64 = 86_400_000;
 const GAP: i64 = 1_800_000;
 const WEEK: i64 = 7 * DAY;
 const LATE: i64 = DAY;
-const NBITS: u32 = 8;
+const NBITS: u32 = 7;
 const NB: usize = 1 << NBITS;
 const SHIFT: u32 = 64 - NBITS;
-const CHUNK: usize = 4 << 20;
+const CHUNK: usize = 8 << 20;
 const PD: usize = 24; // prefetch distance
 
 // ---------- packed slice refs (all data lives in leaked mmaps) ----------
@@ -981,8 +981,8 @@ fn main() {
                 let n: usize = mine.iter().map(|p| p.len()).sum();
                 // group events by person (exact: hash and key) with counting sort
                 let mut pt = PTab::new(n / 4 + 64);
-                let mut pid: Vec<u32> = Vec::with_capacity(n);
                 let mut cnt: Vec<u32> = vec![];
+                let mut src: Vec<Er> = Vec::with_capacity(n);
                 for p in &mine {
                     for e in p {
                         let i = pt.get_or_insert(e.pk.h(), &e.pk);
@@ -990,9 +990,13 @@ fn main() {
                             cnt.push(0);
                         }
                         cnt[i as usize] += 1;
-                        pid.push(i);
+                        src.push(Er { ts: e.ts, pid: i, price: e.price, cat: e.cat, purchase: e.purchase });
                     }
                 }
+                drop(mine);
+                // LSD radix sort by ts, then a stable scatter by person: every person's slice
+                // comes out in time order with no per-person sort
+                radix_ts(&mut src);
                 let np = cnt.len();
                 let mut off: Vec<u32> = Vec::with_capacity(np + 1);
                 let mut s = 0u32;
@@ -1003,17 +1007,12 @@ fn main() {
                 off.push(s);
                 let mut fill: Vec<u32> = off[..np].to_vec();
                 let mut evs: Vec<Ec> = vec![Ec::default(); n];
-                let mut k = 0;
-                for p in &mine {
-                    for e in p {
-                        let i = pid[k] as usize;
-                        k += 1;
-                        evs[fill[i] as usize] = Ec { ts: e.ts, price: e.price, cat: e.cat, purchase: e.purchase };
-                        fill[i] += 1;
-                    }
+                for e in &src {
+                    let i = e.pid as usize;
+                    evs[fill[i] as usize] = Ec { ts: e.ts, price: e.price, cat: e.cat, purchase: e.purchase };
+                    fill[i] += 1;
                 }
-                drop(mine);
-                drop(pid);
+                drop(src);
                 // clicks of the same people
                 let mut cpid: Vec<u32> = vec![];
                 let mut ccnt: Vec<u32> = vec![0; np];
@@ -1055,10 +1054,7 @@ fn main() {
                     touched: vec![],
                 };
                 for i in 0..np {
-                    let es = &mut evs[off[i] as usize..off[i + 1] as usize];
-                    if es.len() > 1 {
-                        es.sort_unstable_by_key(|e| e.ts);
-                    }
+                    let es = &evs[off[i] as usize..off[i + 1] as usize];
                     let cs = &mut cks[coff[i] as usize..coff[i + 1] as usize];
                     if cs.len() > 1 {
                         cs.sort_unstable_by(|a, b| a.ts.cmp(&b.ts).then_with(|| unpack(a.cid).cmp(unpack(b.cid))));
@@ -1111,6 +1107,51 @@ fn main() {
         &t0,
         &format!("done: {} user rows, {} campaign rows", accs.iter().map(|a| a.users.len()).sum::<usize>(), crow.len()),
     );
+}
+
+/// Event with its person index, for the radix sort in phase C.
+#[derive(Clone, Copy, Default)]
+struct Er {
+    ts: u32,
+    pid: u32,
+    price: u32,
+    cat: u16,
+    purchase: bool,
+}
+
+/// Stable LSD radix sort by ts (three passes of 11 bits).
+fn radix_ts(v: &mut Vec<Er>) {
+    let n = v.len();
+    if n < 64 {
+        v.sort_by_key(|e| e.ts);
+        return;
+    }
+    let mut h = vec![[0u32; 2048]; 3];
+    for e in v.iter() {
+        h[0][(e.ts & 2047) as usize] += 1;
+        h[1][((e.ts >> 11) & 2047) as usize] += 1;
+        h[2][(e.ts >> 22) as usize] += 1;
+    }
+    let mut tmp: Vec<Er> = vec![Er::default(); n];
+    for pass in 0..3 {
+        let sh = 11 * pass as u32;
+        // skip a pass whose digit is the same for every element
+        if h[pass].iter().any(|&c| c as usize == n) {
+            continue;
+        }
+        let mut pos = [0u32; 2048];
+        let mut acc = 0u32;
+        for d in 0..2048 {
+            pos[d] = acc;
+            acc += h[pass][d];
+        }
+        for e in v.iter() {
+            let d = ((e.ts >> sh) & 2047) as usize;
+            unsafe { *tmp.get_unchecked_mut(pos[d] as usize) = *e };
+            pos[d] += 1;
+        }
+        std::mem::swap(v, &mut tmp);
+    }
 }
 
 /// Compact per-event and per-click records for phase C.
