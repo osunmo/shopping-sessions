@@ -219,6 +219,49 @@ impl<V: Copy + Default> Table<V> {
     }
 }
 
+/// Direct-index map for keys of the form prefix + decimal number without leading zeros.
+struct Dense {
+    prefix: &'static [u8],
+    v: Vec<u16>, // u16::MAX = absent
+}
+impl Dense {
+    fn num(prefix: &[u8], s: &[u8]) -> Option<usize> {
+        let d = s.strip_prefix(prefix)?;
+        if d.is_empty() || d.len() > 7 || (d[0] == b'0' && d.len() > 1) {
+            return None;
+        }
+        let mut n = 0usize;
+        for &c in d {
+            let x = c.wrapping_sub(b'0');
+            if x > 9 {
+                return None;
+            }
+            n = n * 10 + x as usize;
+        }
+        Some(n)
+    }
+    /// None unless every key is canonical (then lookups are exact).
+    fn build(prefix: &'static [u8], kv: impl Iterator<Item = (Bytes, u16)>) -> Option<Dense> {
+        let mut v: Vec<u16> = vec![];
+        for (k, val) in kv {
+            let n = Self::num(prefix, k)?;
+            if n >= v.len() {
+                v.resize(n + 1, u16::MAX);
+            }
+            v[n] = val;
+        }
+        Some(Dense { prefix, v })
+    }
+    #[inline]
+    fn get(&self, s: &[u8]) -> Option<u16> {
+        let n = Self::num(self.prefix, s)?;
+        match self.v.get(n) {
+            Some(&x) if x != u16::MAX => Some(x),
+            _ => None,
+        }
+    }
+}
+
 // ---------- CSV dialect ----------
 /// Bit masks of (',' | '"' | '\n', '"', '\n') for the 64 bytes at base (zero past the end).
 #[inline(always)]
@@ -798,6 +841,21 @@ fn main() {
         }
     }
     let ncamp = camp_names.len();
+    // exact dense lookups when every key is "<prefix><canonical number>" (one table read, no hashing)
+    let pdense = Dense::build(b"p", (0..).zip(read_small::<2>(&data.join("products.csv"))).map(|(_, [pid, cat])| (pid, cat_tab.get_b(cat).unwrap())));
+    let cdense = Dense::build(b"c_", camp_names.iter().enumerate().map(|(i, &(cid, _))| (cid, i as u16)));
+    let product_cat = |pid: Bytes| -> u16 {
+        match &pdense {
+            Some(d) => d.get(pid).unwrap_or(unknown_cat),
+            None => products.get_b(pid).unwrap_or(unknown_cat),
+        }
+    };
+    let campaign_idx = |c: Bytes| -> Option<u16> {
+        match &cdense {
+            Some(d) => d.get(c),
+            None => campaigns.get_b(c),
+        }
+    };
 
     let ev_paths = list_csv(&data.join("events"));
     let ck_paths = list_csv(&data.join("clicks"));
@@ -826,7 +884,7 @@ fn main() {
                         if eid.is_empty() {
                             return;
                         }
-                        let eh = hash(eid);
+                        let eh = Key::new(eid).h();
                         let ingest = tp.parse(ing).unwrap_or(i64::MAX);
                         let mut e = Ev {
                             eh,
@@ -862,7 +920,7 @@ fn main() {
                             }
                             e.ts = (t - ck_lo) as u32;
                             e.uk = Key::new(uid);
-                            e.cat = products.get_b(pid).unwrap_or(unknown_cat);
+                            e.cat = product_cat(pid);
                             e.flags = 1 | if purchase { 2 } else { 0 };
                         }
                         unsafe { b.get_unchecked_mut((eh >> SHIFT) as usize) }.push(e);
@@ -884,7 +942,7 @@ fn main() {
                         if t < ck_lo || t >= we {
                             return;
                         }
-                        let Some(ci) = campaigns.get_b(camp) else { return };
+                        let Some(ci) = campaign_idx(camp) else { return };
                         let uk = Key::new(uid);
                         v.push(RawCk { uh: uk.h(), uk, ts: (t - ck_lo) as u32, cid: pack(cid), camp: ci });
                     });
