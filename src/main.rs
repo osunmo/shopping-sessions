@@ -336,6 +336,18 @@ impl TsParser {
             if n == 0 {
                 return None;
             }
+            if (9..=16).contains(&n) {
+                // two 8-digit words: s[n-8..n] and s[..n-8] left-padded with '0'
+                let rd = |i: usize| u64::from_le_bytes(s[i..i + 8].try_into().unwrap());
+                let lo = rd(n - 8);
+                let l = n - 8;
+                let hraw = rd(0);
+                let hi = if l == 8 { hraw } else { (hraw << (8 * (8 - l))) | (0x3030_3030_3030_3030u64 >> (8 * l)) };
+                if !all_digits8(lo) || !all_digits8(hi) {
+                    return None;
+                }
+                return Some((digits8(hi) * 100_000_000 + digits8(lo)) as i64);
+            }
             let mut v: u64 = 0;
             for &c in s {
                 let d = c.wrapping_sub(b'0');
@@ -429,6 +441,22 @@ impl TsParser {
     }
 }
 
+/// True if all eight bytes are ASCII digits.
+#[inline(always)]
+fn all_digits8(x: u64) -> bool {
+    (x & 0xF0F0_F0F0_F0F0_F0F0) == 0x3030_3030_3030_3030
+        && ((x.wrapping_add(0x0606_0606_0606_0606)) & 0xF0F0_F0F0_F0F0_F0F0) == 0x3030_3030_3030_3030
+}
+/// Value of eight ASCII digits loaded little-endian (first byte most significant).
+#[inline(always)]
+fn digits8(x: u64) -> u64 {
+    let v = x - 0x3030_3030_3030_3030;
+    let v = (v * 10) + (v >> 8);
+    (((v & 0x0000_00FF_0000_00FF).wrapping_mul(100 + (1_000_000 << 32)))
+        .wrapping_add(((v >> 16) & 0x0000_00FF_0000_00FF).wrapping_mul(1 + (10_000 << 32))))
+        >> 32
+}
+
 fn parse_price(s: &[u8]) -> Option<u32> {
     if s.is_empty() {
         return None;
@@ -455,6 +483,8 @@ fn leak_mmap(p: &Path) -> Bytes {
         return b"";
     }
     let m = unsafe { memmap2::Mmap::map(&f).expect("mmap") };
+    // start reading the whole file now (no-op when it is already cached)
+    let _ = m.advise(memmap2::Advice::WillNeed);
     let m: &'static memmap2::Mmap = Box::leak(Box::new(m));
     &m[..]
 }
@@ -1424,6 +1454,15 @@ mod tests {
         assert!(ok(&mut p, "2000-02-29T10:00:00Z").is_some());
         assert!(ok(&mut p, "1900-02-29T10:00:00Z").is_none());
         assert_eq!(ok(&mut p, "86400000"), Some(86_400_000));
+        for v in [1u64, 9, 10, 99, 123456789, 1791071890000, 1791071890001, 9999999999999999, 100000000, 1000000000000000] {
+            for pad in 0..4 {
+                let t = format!("{}{}", "0".repeat(pad), v);
+                assert_eq!(ok(&mut p, &t), if t.len() <= 19 { Some(v as i64) } else { None }, "{t}");
+            }
+        }
+        for bad in ["17910718900:0", "179107189000/", "1791071890000 ", " 1791071890000", "12345678a", "a12345678"] {
+            assert_eq!(ok(&mut p, bad), None, "{bad:?}");
+        }
     }
 
     #[test]
