@@ -174,6 +174,7 @@ impl<V: Copy + Default> Table<V> {
         Table { mask: cap - 1, slots }
     }
     #[inline]
+    #[allow(dead_code)]
     fn prefetch(&self, h: u64) {
         #[cfg(target_arch = "x86_64")]
         unsafe {
@@ -714,34 +715,72 @@ struct LinkV {
     ph: u64,
 }
 
-#[inline]
-fn resolve(links: &Table<LinkV>, uk: &Key, h: u64) -> (u64, Key) {
-    match links.get(uk, h) {
-        Some(v) => (v.ph, v.pk),
-        None => (h, *uk),
-    }
-}
-
 fn log(t0: &Instant, msg: &str) {
     if std::env::var_os("QUIET").is_none() {
         eprintln!("[{:7.3}s] {}", t0.elapsed().as_secs_f64(), msg);
     }
 }
 
-/// Union-find over links/: every ID maps to its person's name (the byte-wise smallest ID).
-fn build_links(lk_files: &[Bytes]) -> Table<LinkV> {
-    let mut pairs: Vec<(Bytes, Bytes)> = vec![];
-    for c in chunks(lk_files) {
-        scan::<2>(c, |&[a, b]| {
-            if !a.is_empty() && !b.is_empty() {
-                pairs.push((a, b));
-            }
-        });
+/// Union-find over links/ in parallel: every linked ID maps to its person's name (the
+/// byte-wise smallest ID of its set). Returns lookup tables partitioned by the ID's hash bucket.
+fn build_links(lk_files: &[Bytes]) -> LinkTab {
+    #[derive(Clone, Copy)]
+    struct Id {
+        s: Bytes,
+        k: Key,
+        h: u64,
     }
-    let npairs = pairs.len();
-    let mut ids: Table<u32> = Table::new(npairs * 2);
-    let mut names: Vec<(Bytes, u64, Key)> = Vec::with_capacity(npairs * 2);
-    let mut parent: Vec<u32> = Vec::with_capacity(npairs * 2);
+    let mk = |s: Bytes| {
+        let k = Key::new(s);
+        Id { s, k, h: k.h() }
+    };
+    // 1. parse pairs in parallel, scattering IDs by hash shard
+    let parsed: Vec<(Vec<(Id, Id)>, Vec<Vec<Id>>)> = chunks(lk_files)
+        .par_iter()
+        .map(|&c| {
+            let mut v = vec![];
+            let mut sh: Vec<Vec<Id>> = (0..NB).map(|_| vec![]).collect();
+            scan::<2>(c, |&[a, b]| {
+                if !a.is_empty() && !b.is_empty() {
+                    let (a, b) = (mk(a), mk(b));
+                    sh[(a.h >> SHIFT) as usize].push(a);
+                    sh[(b.h >> SHIFT) as usize].push(b);
+                    v.push((a, b));
+                }
+            });
+            (v, sh)
+        })
+        .collect();
+    // 2. intern IDs per hash shard in parallel
+    let shard_ids: Vec<Vec<Id>> =
+        (0..NB).into_par_iter().map(|i| parsed.iter().flat_map(|(_, sh)| sh[i].iter().copied()).collect()).collect();
+    let pairs: Vec<Vec<(Id, Id)>> = parsed.into_iter().map(|(v, _)| v).collect();
+    let interned: Vec<(Table<u32>, Vec<Id>)> = shard_ids
+        .into_par_iter()
+        .map(|v| {
+            let mut t: Table<u32> = Table::new(v.len());
+            let mut ids: Vec<Id> = vec![];
+            for id in v {
+                let (_, ins) = t.get_or_insert(id.k, id.h, ids.len() as u32);
+                if ins {
+                    ids.push(id);
+                }
+            }
+            (t, ids)
+        })
+        .collect();
+    let mut off = vec![0u32; NB + 1];
+    for i in 0..NB {
+        off[i + 1] = off[i] + interned[i].1.len() as u32;
+    }
+    let n = off[NB] as usize;
+    let gid = |id: &Id| -> u32 {
+        let sh = (id.h >> SHIFT) as usize;
+        off[sh] + interned[sh].0.get(&id.k, id.h).unwrap()
+    };
+    // 3. edges as global ids (parallel), then union-find (serial, integers only)
+    let edges: Vec<Vec<(u32, u32)>> = pairs.par_iter().map(|p| p.iter().map(|(a, b)| (gid(a), gid(b))).collect()).collect();
+    let mut parent: Vec<u32> = (0..n as u32).collect();
     fn find(p: &mut [u32], mut x: u32) -> u32 {
         while p[x as usize] != x {
             let g = p[p[x as usize] as usize];
@@ -750,42 +789,95 @@ fn build_links(lk_files: &[Bytes]) -> Table<LinkV> {
         }
         x
     }
-    for (k, &(a, b)) in pairs.iter().enumerate() {
-        if let Some(&(na, _)) = pairs.get(k + 8) {
-            ids.prefetch(Key::new(na).h());
-        }
-        let mut idx = |s: Bytes| {
-            let key = Key::new(s);
-            let h = key.h();
-            let (i, ins) = ids.get_or_insert(key, h, names.len() as u32);
-            if ins {
-                names.push((s, h, key));
-                parent.push(i);
-            }
-            i
-        };
-        let ia = idx(a);
-        let ib = idx(b);
-        let ra = find(&mut parent, ia);
-        let rb = find(&mut parent, ib);
-        if ra != rb {
-            // the root is always the byte-wise smallest ID of its set
-            if names[ra as usize].0 <= names[rb as usize].0 {
-                parent[rb as usize] = ra;
-            } else {
-                parent[ra as usize] = rb;
+    for e in &edges {
+        for &(a, b) in e {
+            let ra = find(&mut parent, a);
+            let rb = find(&mut parent, b);
+            if ra != rb {
+                parent[ra.max(rb) as usize] = ra.min(rb);
             }
         }
     }
-    drop(ids);
-    let mut links: Table<LinkV> = Table::new(names.len());
-    for i in 0..names.len() {
-        let r = find(&mut parent, i as u32) as usize;
-        let (_, h, key) = names[i];
-        let (_, rh, rk) = names[r];
-        links.get_or_insert(key, h, LinkV { pk: rk, ph: rh });
+    let id_of = |g: u32| -> &Id {
+        let sh = off.partition_point(|&o| o <= g) - 1;
+        &interned[sh].1[(g - off[sh]) as usize]
+    };
+    // 4. name every set by its smallest ID
+    let mut root: Vec<u32> = vec![0; n];
+    let mut best: Vec<u32> = (0..n as u32).collect();
+    for g in 0..n as u32 {
+        let r = find(&mut parent, g);
+        root[g as usize] = r;
+        if id_of(g).s < id_of(best[r as usize]).s {
+            best[r as usize] = g;
+        }
     }
-    links
+    // 5. one lookup table with a slice per shard, in a single huge-page-backed allocation
+    let caps: Vec<usize> = interned.iter().map(|(_, ids)| (ids.len() + ids.len() / 2 + 16).next_power_of_two()).collect();
+    let total: usize = caps.iter().sum();
+    let mut slots = huge_vec::<Slot<LinkV>>(total);
+    slots.resize(total, Slot { h: 0, k: Key { a: 0, b: EMPTY }, v: LinkV::default() });
+    let mut parts: Vec<(usize, usize)> = Vec::with_capacity(NB);
+    let mut o = 0;
+    for &c in &caps {
+        parts.push((o, c - 1));
+        o += c;
+    }
+    let mut rest: &mut [Slot<LinkV>] = &mut slots;
+    let mut pieces: Vec<&mut [Slot<LinkV>]> = Vec::with_capacity(NB);
+    for &c in &caps {
+        let (a, b) = rest.split_at_mut(c);
+        pieces.push(a);
+        rest = b;
+    }
+    pieces.into_par_iter().enumerate().for_each(|(sh, piece)| {
+        let mask = piece.len() - 1;
+        for (i, id) in interned[sh].1.iter().enumerate() {
+            let g = off[sh] + i as u32;
+            let nm = id_of(best[root[g as usize] as usize]);
+            let mut p = (id.h as usize) & mask;
+            while piece[p].k.b != EMPTY {
+                p = (p + 1) & mask;
+            }
+            piece[p] = Slot { h: id.h, k: id.k, v: LinkV { pk: nm.k, ph: nm.h } };
+        }
+    });
+    LinkTab { slots, parts }
+}
+
+/// Linked-ID lookup: one slot array, one open-addressing slice per hash shard.
+struct LinkTab {
+    slots: Vec<Slot<LinkV>>,
+    parts: Vec<(usize, usize)>, // (offset, mask)
+}
+impl LinkTab {
+    #[inline]
+    #[allow(dead_code)]
+    fn prefetch(&self, h: u64) {
+        #[cfg(target_arch = "x86_64")]
+        unsafe {
+            use std::arch::x86_64::{_MM_HINT_T0, _mm_prefetch};
+            let (o, m) = *self.parts.get_unchecked((h >> SHIFT) as usize);
+            let p = self.slots.as_ptr().add(o + ((h as usize) & m)) as *const i8;
+            _mm_prefetch(p, _MM_HINT_T0);
+            _mm_prefetch(p.add(std::mem::size_of::<Slot<LinkV>>() - 1), _MM_HINT_T0);
+        }
+    }
+    #[inline]
+    fn resolve(&self, k: &Key, h: u64) -> (u64, Key) {
+        let (o, m) = unsafe { *self.parts.get_unchecked((h >> SHIFT) as usize) };
+        let mut i = (h as usize) & m;
+        loop {
+            let s = unsafe { self.slots.get_unchecked(o + i) };
+            if s.k.b == EMPTY {
+                return (h, *k);
+            }
+            if s.h == h && s.k.same(k) {
+                return (s.v.ph, s.v.pk);
+            }
+            i = (i + 1) & m;
+        }
+    }
 }
 
 fn main() {
@@ -1027,7 +1119,7 @@ fn main() {
                 if let Some(&nh) = hs.get(k + PD) {
                     links.prefetch(nh);
                 }
-                let (ph, pk) = resolve(links, &e.uk, hs[k]);
+                let (ph, pk) = links.resolve(&e.uk, hs[k]);
                 unsafe { out.get_unchecked_mut((ph >> SHIFT) as usize) }.push(Kept {
                     pk,
                     ts: e.ts,
@@ -1054,7 +1146,7 @@ fn main() {
                 if let Some(nx) = v.get(k + PD) {
                     links.prefetch(nx.uh);
                 }
-                let (ph, pk) = resolve(links, &c.uk, c.uh);
+                let (ph, pk) = links.resolve(&c.uk, c.uh);
                 unsafe { b.get_unchecked_mut((ph >> SHIFT) as usize) }.push(Ck { pk, ts: c.ts, cid: c.cid, camp: c.camp });
             }
             b
