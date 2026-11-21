@@ -76,6 +76,15 @@ impl Key {
     fn same(&self, o: &Key) -> bool {
         (self.a == o.a && self.b == o.b) || (self.b == LONG && o.b == LONG && unpack(self.a) == unpack(o.a))
     }
+    /// Hash of the key's bytes (inline keys hash their two words, long keys their bytes).
+    #[inline]
+    fn h(&self) -> u64 {
+        if self.b == LONG {
+            hash(unpack(self.a))
+        } else {
+            fmix(self.a.wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ self.b.wrapping_mul(0xC2B2_AE3D_27D4_EB4F).rotate_left(29))
+        }
+    }
     fn bytes(&self) -> Vec<u8> {
         if self.b == LONG {
             unpack(self.a).to_vec()
@@ -177,7 +186,8 @@ impl<V: Copy + Default> Table<V> {
     }
     #[inline]
     fn get_b(&self, s: Bytes) -> Option<V> {
-        self.get(&Key::new(s), hash(s))
+        let k = Key::new(s);
+        self.get(&k, k.h())
     }
     /// Returns (value, inserted).
     fn get_or_insert(&mut self, k: Key, h: u64, v: V) -> (V, bool) {
@@ -531,6 +541,24 @@ fn read_small<const N: usize>(p: &Path) -> Vec<[Bytes; N]> {
     v
 }
 
+/// A slot that exactly one task empties; lets per-bucket inputs be freed as they are consumed.
+struct Take<T>(std::cell::UnsafeCell<T>);
+unsafe impl<T: Send> Sync for Take<T> {}
+impl<T: Default> Take<T> {
+    fn new(t: T) -> Self {
+        Take(std::cell::UnsafeCell::new(t))
+    }
+    /// Safety contract: each bucket index is processed by exactly one task.
+    fn take(&self) -> T {
+        unsafe { std::mem::take(&mut *self.0.get()) }
+    }
+}
+impl<T> Take<Vec<T>> {
+    fn len(&self) -> usize {
+        unsafe { (*self.0.get()).len() }
+    }
+}
+
 // ---------- records ----------
 #[derive(Clone, Copy)]
 struct Ev {
@@ -538,7 +566,6 @@ struct Ev {
     eid: u64, // packed ref, compared only when hashes match
     ingest: i64,
     ts: i64,
-    uh: u64,
     uk: Key,
     price: u32,
     cat: u16,
@@ -623,11 +650,11 @@ fn build_links(lk_files: &[Bytes]) -> Table<LinkV> {
     }
     for (k, &(a, b)) in pairs.iter().enumerate() {
         if let Some(&(na, _)) = pairs.get(k + 8) {
-            ids.prefetch(hash(na));
+            ids.prefetch(Key::new(na).h());
         }
         let mut idx = |s: Bytes| {
-            let h = hash(s);
             let key = Key::new(s);
+            let h = key.h();
             let (i, ins) = ids.get_or_insert(key, h, names.len() as u32);
             if ins {
                 names.push((s, h, key));
@@ -687,11 +714,11 @@ fn main() {
     let plines = read_small::<2>(&data.join("products.csv"));
     let mut products: Table<u16> = Table::new(plines.len());
     for [pid, cat] in plines {
-        let (ci, ins) = cat_tab.get_or_insert(Key::new(cat), hash(cat), cat_names.len() as u16);
+        let (ci, ins) = cat_tab.get_or_insert(Key::new(cat), Key::new(cat).h(), cat_names.len() as u16);
         if ins {
             cat_names.push(cat);
         }
-        products.get_or_insert(Key::new(pid), hash(pid), ci);
+        products.get_or_insert(Key::new(pid), Key::new(pid).h(), ci);
     }
     let unknown_cat = cat_names.len() as u16;
     cat_names.push(b"unknown");
@@ -704,7 +731,7 @@ fn main() {
     let mut campaigns: Table<u16> = Table::new(4096);
     let mut camp_names: Vec<(Bytes, Bytes)> = vec![];
     for [cid, ch] in read_small::<2>(&data.join("campaigns.csv")) {
-        let (_, ins) = campaigns.get_or_insert(Key::new(cid), hash(cid), camp_names.len() as u16);
+        let (_, ins) = campaigns.get_or_insert(Key::new(cid), Key::new(cid).h(), camp_names.len() as u16);
         if ins {
             camp_names.push((cid, ch));
         }
@@ -744,7 +771,6 @@ fn main() {
                             eid: pack(eid),
                             ingest,
                             ts: 0,
-                            uh: 0,
                             uk: Key::default(),
                             price: 0,
                             cat: 0,
@@ -773,7 +799,6 @@ fn main() {
                                 break 'v;
                             }
                             e.ts = t;
-                            e.uh = hash(uid);
                             e.uk = Key::new(uid);
                             e.cat = products.get_b(pid).unwrap_or(unknown_cat);
                             e.flags = 1 | if purchase { 2 } else { 0 };
@@ -798,7 +823,8 @@ fn main() {
                             return;
                         }
                         let Some(ci) = campaigns.get_b(camp) else { return };
-                        v.push(RawCk { uh: hash(uid), uk: Key::new(uid), ts: t, cid: pack(cid), camp: ci });
+                        let uk = Key::new(uid);
+                        v.push(RawCk { uh: uk.h(), uk, ts: t, cid: pack(cid), camp: ci });
                     });
                     v
                 })
@@ -810,13 +836,14 @@ fn main() {
 
     // ---------- phase B: dedup on event_id, resolve persons, scatter by person ----------
     let links = &links;
+    let parts: Vec<Vec<Take<Vec<Ev>>>> = parts.into_iter().map(|p| p.into_iter().map(Take::new).collect()).collect();
     let kept_parts: Vec<Vec<Vec<Kept>>> = (0..NB)
         .into_par_iter()
         .map(|bi| {
             let n: usize = parts.iter().map(|p| p[bi].len()).sum();
             let mut v: Vec<Ev> = Vec::with_capacity(n);
             for p in &parts {
-                v.extend_from_slice(&p[bi]);
+                v.extend_from_slice(&p[bi].take());
             }
             let cap = (n * 2).next_power_of_two().max(16);
             let mask = cap - 1;
@@ -852,15 +879,16 @@ fn main() {
             drop(tab);
             let idx: Vec<u32> = (0..n as u32).filter(|&t| win[t as usize] && v[t as usize].flags & 1 != 0).collect();
             let mut out: Vec<Vec<Kept>> = (0..NB).map(|_| Vec::with_capacity(idx.len() / NB + 16)).collect();
-            for &t in idx.iter().take(PD) {
-                links.prefetch(v[t as usize].uh);
+            let hs: Vec<u64> = idx.iter().map(|&t| v[t as usize].uk.h()).collect();
+            for &h in hs.iter().take(PD) {
+                links.prefetch(h);
             }
             for (k, &t) in idx.iter().enumerate() {
-                if let Some(&nx) = idx.get(k + PD) {
-                    links.prefetch(v[nx as usize].uh);
+                if let Some(&nh) = hs.get(k + PD) {
+                    links.prefetch(nh);
                 }
                 let e = &v[t as usize];
-                let (ph, pk) = resolve(links, &e.uk, e.uh);
+                let (ph, pk) = resolve(links, &e.uk, hs[k]);
                 unsafe { out.get_unchecked_mut((ph >> SHIFT) as usize) }.push(Kept {
                     ph,
                     pk,
@@ -905,6 +933,8 @@ fn main() {
         users: Vec<URow>,
         camp: Vec<[i64; 4]>, // sessions, purchasing, revenue, assisted
     }
+    let kept_parts: Vec<Vec<Take<Vec<Kept>>>> =
+        kept_parts.into_iter().map(|p| p.into_iter().map(Take::new).collect()).collect();
     let accs: Vec<Acc> = (0..NB)
         .into_par_iter()
         .fold(
@@ -913,7 +943,7 @@ fn main() {
                 let n: usize = kept_parts.iter().map(|p| p[bi].len()).sum();
                 let mut ev: Vec<Kept> = Vec::with_capacity(n);
                 for p in &kept_parts {
-                    ev.extend_from_slice(&p[bi]);
+                    ev.extend_from_slice(&p[bi].take());
                 }
                 let m: usize = ck_parts.iter().map(|p| p[bi].len()).sum();
                 let mut ck: Vec<Ck> = Vec::with_capacity(m);
