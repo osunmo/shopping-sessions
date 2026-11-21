@@ -85,6 +85,17 @@ impl Key {
             fmix(self.a.wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ self.b.wrapping_mul(0xC2B2_AE3D_27D4_EB4F).rotate_left(29))
         }
     }
+    fn append_to(&self, out: &mut Vec<u8>) {
+        if self.b == LONG {
+            out.extend_from_slice(unpack(self.a));
+        } else {
+            let mut buf = [0u8; 16];
+            buf[..8].copy_from_slice(&self.a.to_le_bytes());
+            buf[8..].copy_from_slice(&self.b.to_le_bytes());
+            out.extend_from_slice(&buf[..buf[15] as usize]);
+        }
+    }
+    #[cfg_attr(not(test), allow(dead_code))]
     fn bytes(&self) -> Vec<u8> {
         if self.b == LONG {
             unpack(self.a).to_vec()
@@ -221,7 +232,7 @@ fn masks(d: &[u8], base: usize) -> (u64, u64, u64) {
             let mc = mm(a, b',' as i8) | (mm(b, b',' as i8) << 32);
             let mq = mm(a, b'"' as i8) | (mm(b, b'"' as i8) << 32);
             let mn = mm(a, b'\n' as i8) | (mm(b, b'\n' as i8) << 32);
-            return (mc | mq | mn, mq, mn);
+            return (mc, mq, mn);
         }
     }
     let (mut mc, mut mq, mut mn) = (0u64, 0u64, 0u64);
@@ -231,71 +242,82 @@ fn masks(d: &[u8], base: usize) -> (u64, u64, u64) {
         mq |= ((c == b'"') as u64) << i;
         mn |= ((c == b'\n') as u64) << i;
     }
-    (mc | mq | mn, mq, mn)
+    (mc, mq, mn)
 }
 
 /// Calls f with the N fields of every well-formed line in the chunk (rules.md CSV dialect):
 /// only '\n' ends a line, every ',' separates fields, a field may be wrapped in quotes as a
 /// whole and must hold no other quote, and a line with any other field count is dropped.
+///
+/// Only commas and newlines are visited. Quotes are counted once per line with popcount: a line
+/// is valid when every field that starts with '"' also ends with one (length >= 2) and the line
+/// holds exactly two quotes per such field, so no quote can sit anywhere else.
 #[inline]
 fn scan<const N: usize>(chunk: Bytes, mut f: impl FnMut(&[Bytes; N])) {
-    let mut out: [Bytes; N] = [b""; N];
-    let mut k = 0usize; // field index
-    let mut fs = 0usize; // field start
-    let mut q = 0u32; // quotes in this field
-    let mut fq = 0usize; // first quote position
-    let mut bad = false;
-    macro_rules! end_field {
-        ($p:expr) => {{
-            let p = $p;
-            if k >= N {
-                bad = true;
-            } else if q == 0 {
-                out[k] = unsafe { chunk.get_unchecked(fs..p) };
-            } else if q == 2 && fq == fs && p >= fs + 2 && chunk[p - 1] == b'"' {
-                out[k] = unsafe { chunk.get_unchecked(fs + 1..p - 1) };
-            } else {
-                bad = true;
-            }
-            k += 1;
-            q = 0;
-            fs = p + 1;
-        }};
-    }
+    let mut ends = [0usize; N];
+    let mut k = 0usize; // separators seen on this line
+    let mut ls = 0usize; // line start
+    let mut qls = 0u64; // quotes before the line start
+    let mut qbase = 0u64; // quotes before this block
     let n = chunk.len();
+    #[inline(always)]
+    fn line<const N: usize>(chunk: Bytes, ls: usize, ends: &[usize; N], quotes: u64, out: &mut [Bytes; N]) -> bool {
+        let mut a = ls;
+        let mut qf = 0u64;
+        let mut ok = true;
+        for i in 0..N {
+            let b = ends[i];
+            if quotes == 0 {
+                out[i] = unsafe { chunk.get_unchecked(a..b) };
+            } else {
+                let q = a < b && unsafe { *chunk.get_unchecked(a) } == b'"';
+                if q {
+                    ok &= b >= a + 2 && unsafe { *chunk.get_unchecked(b - 1) } == b'"';
+                    out[i] = unsafe { chunk.get_unchecked(a + 1..(b - 1).max(a + 1)) };
+                    qf += 1;
+                } else {
+                    out[i] = unsafe { chunk.get_unchecked(a..b) };
+                }
+            }
+            a = b + 1;
+        }
+        ok && quotes == 2 * qf
+    }
+    let mut out: [Bytes; N] = [b""; N];
     let mut base = 0usize;
     while base < n {
-        let (mut m, mq, mn) = masks(chunk, base);
+        let (mc, mq, mn) = masks(chunk, base);
+        let mut m = mc | mn;
         while m != 0 {
-            let bit = m.trailing_zeros() as usize;
-            let bm = 1u64 << bit;
+            let bit = m.trailing_zeros();
             m &= m - 1;
-            let p = base + bit;
-            if mq & bm != 0 {
-                if q == 0 {
-                    fq = p;
-                }
-                q += 1;
-            } else if mn & bm != 0 {
-                end_field!(p);
-                if !bad && k == N {
+            let p = base + bit as usize;
+            if k < N {
+                ends[k] = p;
+            }
+            k += 1;
+            if (mn >> bit) & 1 != 0 {
+                let qp = qbase + (mq & ((1u64 << bit) - 1)).count_ones() as u64;
+                if k == N && line::<N>(chunk, ls, &ends, qp - qls, &mut out) {
                     f(&out);
                 }
                 k = 0;
-                bad = false;
-            } else {
-                end_field!(p);
+                ls = p + 1;
+                qls = qp;
             }
         }
+        qbase += mq.count_ones() as u64;
         base += 64;
     }
-    if fs < n {
-        end_field!(n);
-        if !bad && k == N {
+    if ls < n {
+        if k < N {
+            ends[k] = n;
+        }
+        k += 1;
+        if k == N && line::<N>(chunk, ls, &ends, qbase - qls, &mut out) {
             f(&out);
         }
     }
-    let _ = (fs, q);
 }
 
 // ---------- timestamps ----------
@@ -751,7 +773,7 @@ fn main() {
             let parts: Vec<Vec<Vec<Ev>>> = ev_chunks
                 .par_iter()
                 .map(|&c| {
-                    let mut b: Vec<Vec<Ev>> = (0..NB).map(|_| Vec::with_capacity(c.len() / 70 / NB + 16)).collect();
+                    let mut b: Vec<Vec<Ev>> = (0..NB).map(|_| Vec::with_capacity(c.len() / 60 / NB + 32)).collect();
                     let mut tp = TsParser::default();
                     scan::<7>(c, |&[eid, uid, ts, ing, ty, pid, pr]| {
                         if eid.is_empty() {
@@ -892,7 +914,7 @@ fn main() {
                 }
             }
             let hs: Vec<u64> = keep.iter().map(|e| e.uk.h()).collect();
-            let mut out: Vec<Vec<Kept>> = (0..NB).map(|_| Vec::with_capacity(keep.len() / NB + 16)).collect();
+            let mut out: Vec<Vec<Kept>> = (0..NB).map(|_| Vec::with_capacity(keep.len() * 5 / 4 / NB + 32)).collect();
             for &h in hs.iter().take(PD) {
                 links.prefetch(h);
             }
@@ -1326,7 +1348,23 @@ fn write_users(path: &Path, rows: &[URow], cats: &[Bytes]) {
     while let Some(mut col) = rg.next_column().unwrap() {
         match idx {
             0 => {
-                let v: Vec<ByteArray> = rows.iter().map(|r| ByteArray::from(r.name.bytes())).collect();
+                // one shared buffer for all names: no allocation per row
+                let mut buf: Vec<u8> = Vec::with_capacity(rows.len() * 12);
+                let mut ends: Vec<usize> = Vec::with_capacity(rows.len());
+                for r in rows {
+                    r.name.append_to(&mut buf);
+                    ends.push(buf.len());
+                }
+                let big = bytes::Bytes::from(buf);
+                let mut st = 0;
+                let v: Vec<ByteArray> = ends
+                    .iter()
+                    .map(|&e| {
+                        let b = ByteArray::from(big.slice(st..e));
+                        st = e;
+                        b
+                    })
+                    .collect();
                 col.typed::<ByteArrayType>().write_batch(&v, None, None).unwrap();
             }
             1 => {
@@ -1346,7 +1384,7 @@ fn write_users(path: &Path, rows: &[URow], cats: &[Bytes]) {
             }
             _ => {
                 let v: Vec<ByteArray> =
-                    rows.iter().filter(|r| r.top >= 0).map(|r| ByteArray::from(cats[r.top as usize])).collect();
+                    rows.iter().filter(|r| r.top >= 0).map(|r| ByteArray::from(bytes::Bytes::from_static(cats[r.top as usize]))).collect();
                 let d: Vec<i16> = rows.iter().map(|r| (r.top >= 0) as i16).collect();
                 col.typed::<ByteArrayType>().write_batch(&v, Some(&d), None).unwrap();
             }
@@ -1380,7 +1418,7 @@ fn write_camps(path: &Path, rows: &[(Bytes, Bytes, i32, [i64; 4])]) {
     while let Some(mut col) = rg.next_column().unwrap() {
         match idx {
             0 | 1 => {
-                let v: Vec<ByteArray> = rows.iter().map(|r| ByteArray::from(if idx == 0 { r.0 } else { r.1 })).collect();
+                let v: Vec<ByteArray> = rows.iter().map(|r| ByteArray::from(bytes::Bytes::from_static(if idx == 0 { r.0 } else { r.1 }))).collect();
                 col.typed::<ByteArrayType>().write_batch(&v, None, None).unwrap();
             }
             2 => {
