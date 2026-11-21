@@ -1,0 +1,3 @@
+[target.x86_64-unknown-linux-gnu]
+# Scorers are Cascade Lake or newer: AVX2/BMI2 are always there.
+rustflags = ["-C", "target-cpu=x86-64-v3"]
